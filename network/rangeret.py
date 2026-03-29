@@ -4,6 +4,7 @@ import math
 import torch
 from torch import nn
 
+from network.interfaces import SegmentationModel
 from network.retnet import RetNet
 from network.vision_embedding import VisionEmbedding
 from network.stem import ConvStem
@@ -198,7 +199,7 @@ class Decoder(nn.Module):
         
         return x
 
-class RangeRet(nn.Module):
+class RangeRet(SegmentationModel):
     def __init__(self, model_params: dict, resolution, num_classes=20, activate_recurrent=False):
         super(RangeRet, self).__init__()
         self.H = resolution[0]
@@ -258,4 +259,5 @@ class RangeRet(nn.Module):
 
         x = self.head(x, residual)
 
-        return x
+        logits = x.permute(0, 3, 1, 2).contiguous()
+        return {"logits": logits, "aux": {}}

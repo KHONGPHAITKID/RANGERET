@@ -1,0 +1,96 @@
+# Config format schema number
+format_version: 2
+
+###################
+## Model options
+model:
+  name: "mambarv"
+  pretrained_component: "full"
+  params:
+    input_dim: 5
+    use_circular_padding: True
+    encoder_channels: [32, 64, 128, 256]
+    decoder_channels: [128, 64, 32]
+    mamba:
+      depth: 3
+      d_state: 16
+      d_conv: 4
+      expand: 2
+
+loss:
+  terms:
+    - name: "cross_entropy"
+      weight: 1.0
+    - name: "boundary"
+      weight: 1.0
+    - name: "lovasz"
+      weight: 1.5
+
+postprocess:
+  name: "knn"
+  enabled: True
+  params:
+    knn: 7
+    search: 7
+    sigma: 1.0
+    cutoff: 1.0
+
+mlflow:
+  enable: true
+  tracking_uri: "http://140.245.117.232:5000"
+  experiment_name: "rangeret"
+  run_name: "[train] mambarv_semantickitti"
+  nested: false
+  log_checkpoints: false
+  log_code_snapshot: false
+
+###################
+## Dataset options
+dataset:
+  pc_dataset_type: "SemanticKITTI"
+  collate_type: "collate_fn_default"
+  ignore_label: 0
+  data_config: "./config/labels/semantic-kitti.yaml"
+  num_classes: 20
+  max_points: 150000
+  sensor:
+    name: "HDL64"
+    type: "spherical"
+    fov_up: 3
+    fov_down: -25
+    img_prop:
+      width: 1024
+      height: 64
+    img_means:
+      - 12.12
+      - 10.88
+      - 0.23
+      - -1.04
+      - 0.21
+    img_stds:
+      - 12.32
+      - 11.47
+      - 6.91
+      - 0.86
+      - 0.16
+
+###################
+## Train params
+train:
+  epochs: 70
+  learning_rate: 1.0e-3
+  weight_decay: 0.05
+  optimizer: AdamW
+  batch_size: 8
+  workers: 4
+  epsilon_w: 0.001
+  range_aug: False
+
+  scheduler:
+    name: "WarmupCosine"
+    max_lr: 0.001
+    total_steps: 1000
+    pct_start: 0.02
+
+  report_epoch: 1
+  show_scans: False

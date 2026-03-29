@@ -12,20 +12,20 @@ import matplotlib.pyplot as plt
 
 from utils.avgmeter import AverageMeter
 from utils.ioueval import iouEval
-from utils.lovasz_loss import Lovasz_loss
-from utils.boundary_loss import BoundaryLoss
 
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.sync_batchnorm.batchnorm import convert_model
 from utils.scheduler import WarmupCosine, WarmupCosineLR
-
-from network.rangeret import RangeRet
+from utils.checkpoint import load_model_weights, load_pretrained_weights
+from network.factory import build_model, get_model_config, get_model_name
+from network.interfaces import get_logits
+from losses.factory import build_loss_bundle
 
 from dataloader.rangeaug import RangeAugmentation
 
 class Trainer():
-    def __init__(self, ARCH, DATA, datadir, logdir, checkpoint=None, pretrained=None, fp16=False):
+    def __init__(self, ARCH, DATA, datadir, logdir, checkpoint=None, pretrained=None, fp16=False, tracker=None):
         # parameters
         self.ARCH = ARCH
         self.DATA = DATA
@@ -34,6 +34,7 @@ class Trainer():
         self.checkpoint = checkpoint
         self.pretrained = pretrained
         self.fp16 = fp16
+        self.tracker = tracker
 
         # get data
         if self.ARCH['dataset']['pc_dataset_type'] == 'SemanticKITTI':
@@ -78,15 +79,19 @@ class Trainer():
         print("Loss weights from content: ", self.loss_w.data)
 
         with torch.no_grad():
-            self.model = RangeRet(self.ARCH['model_params'],
-                                  self.parser.get_resolution(),
-                                  self.parser.get_n_classes())
+            self.model = build_model(self.ARCH,
+                                     self.parser.get_resolution(),
+                                     self.parser.get_n_classes())
+        self.model_cfg = get_model_config(self.ARCH)
+        self.model_name = get_model_name(self.ARCH)
 
         # print details of the model
         # for name, param in self.model.named_parameters():
         #     print(f"Layer: {name}, Parameters: {param.numel()}")
 
-        print(f'Backbone: {self.ARCH["model_params"]["backbone"]}')
+        backbone_name = self.model_cfg["params"].get("backbone", self.model_name)
+        print(f'Architecture: {self.model_name}')
+        print(f'Backbone: {backbone_name}')
 
         num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f'Number of parameters {num_params/1000000} M')
@@ -115,15 +120,7 @@ class Trainer():
             self.n_gpus = torch.cuda.device_count()
 
         # Losses
-        self.criterion = nn.CrossEntropyLoss(ignore_index=self.ARCH['dataset']['ignore_label'], weight=self.loss_w).to(self.device)
-        self.lovasz = Lovasz_loss(ignore=self.ARCH['dataset']['ignore_label']).to(self.device)
-        self.bd = BoundaryLoss().to(self.device)
-        # loss as dataparallel too (more images in batch)
-        if self.n_gpus > 1:
-            self.criterion = nn.DataParallel(self.criterion).cuda()
-            self.lovasz = nn.DataParallel(self.lovasz).cuda()
-            #self.focal = nn.DataParallel(self.focal).cuda()
-            self.bd = nn.DataParallel(self.bd).cuda()
+        self.loss_fn = build_loss_bundle(self.ARCH, self.loss_w, self.device)
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(),
                                            lr=self.ARCH['train']['learning_rate'],
@@ -160,7 +157,7 @@ class Trainer():
         # Checkpoint model config
         if self.checkpoint is not None:
             try:
-                self.model.load_state_dict(torch.load(self.checkpoint))
+                load_model_weights(self.model_single, self.checkpoint)
                 print(f'Checkpoint loaded from {self.checkpoint}')
             except:
                 print(f'Error loading checkpoint from {self.checkpoint}')
@@ -168,10 +165,14 @@ class Trainer():
         # Pretrained RetNet model
         if self.pretrained is not None:
             try:
-                self.model.backbone.load_state_dict(torch.load(self.pretrained))
-                print(f'Pre-trained RetNet loaded from {self.pretrained}')
+                model_cfg = self.ARCH.get("model", {})
+                default_component = "backbone" if hasattr(self.model_single, "backbone") else "full"
+                component = model_cfg.get("pretrained_component", default_component)
+                load_pretrained_weights(self.model_single, self.pretrained, component=component)
+                component_name = component
+                print(f'Pre-trained {component_name} loaded from {self.pretrained}')
             except:
-                print(f'Error loading RetNet from {self.pretrained}')
+                print(f'Error loading pretrained weights from {self.pretrained}')
 
         # tensorboard
         self.writer_train = SummaryWriter(log_dir=self.logdir + "/tensorboard/train/", flush_secs=30)
@@ -198,7 +199,6 @@ class Trainer():
             # train for 1 epoch
             acc, iou, loss = self.train_epoch(train_loader=self.parser.get_train_set(),
                                               model=self.model,
-                                              criterion=self.criterion,
                                               optimizer=self.optimizer,
                                               epoch=epoch,
                                               show_scans=self.ARCH['train']['show_scans'],
@@ -207,6 +207,15 @@ class Trainer():
                                               scheduler=self.scheduler)
 
             print('Train | acc: {:.2%} | mIoU: {:.2%} | loss: {:.5}'.format(acc, iou, loss))
+            if self.tracker is not None:
+                self.tracker.log_metrics(
+                    {
+                        "train/loss": loss,
+                        "train/acc": acc,
+                        "train/miou": iou,
+                    },
+                    step=epoch,
+                )
 
             # update best iou and save checkpoint
             if iou > best_train_iou:
@@ -219,19 +228,27 @@ class Trainer():
                 # evaluate on validation set
                 val_acc, val_iou, val_loss = self.validate(val_loader=self.parser.get_valid_set(),
                                                model=self.model,
-                                               criterion=self.criterion,
                                                epoch=epoch,
                                                show_scans=self.ARCH['train']['show_scans'],
                                                color_fn=self.parser.to_color,
                                                evaluator=self.evaluator)
 
                 print('Validation | acc: {:.2%} | mIoU: {:.2%} | loss: {:.5}'.format(val_acc, val_iou, val_loss))
+                if self.tracker is not None:
+                    self.tracker.log_metrics(
+                        {
+                            "val/loss": val_loss,
+                            "val/acc": val_acc,
+                            "val/miou": val_iou,
+                        },
+                        step=epoch,
+                    )
 
                 if val_iou > best_val_iou:
                     print('Best mIoU in validation so far, model saved!')
                     best_val_iou = val_iou
                     # TODO save the weights
-                    torch.save(self.model_single.state_dict(), os.path.join(self.logdir, f"{self.ARCH['model_params']['model_architecture']}-best.pt"))
+                    torch.save(self.model_single.state_dict(), os.path.join(self.logdir, f"{self.model_name}-best.pt"))
             
             # update log
             log_data.append((acc, iou, loss, val_acc, val_iou, val_loss))
@@ -240,13 +257,13 @@ class Trainer():
         log_data = np.array(log_data, dtype=np.float32)
         np.savetxt(os.path.join(self.logdir, 'training_log.txt'), log_data, fmt='%f')
 
-        torch.save(self.model_single.state_dict(), os.path.join(self.logdir, f"{self.ARCH['model_params']['model_architecture']}-last.pt"))
+        torch.save(self.model_single.state_dict(), os.path.join(self.logdir, f"{self.model_name}-last.pt"))
 
         print('Finished Training')
 
         return
 
-    def train_epoch(self, train_loader, model, criterion, optimizer, epoch, show_scans, color_fn, evaluator, scheduler):
+    def train_epoch(self, train_loader, model, optimizer, epoch, show_scans, color_fn, evaluator, scheduler):
         losses = AverageMeter()
         acc = AverageMeter()
         iou = AverageMeter()
@@ -270,15 +287,10 @@ class Trainer():
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 outputs = model(in_vol)
-
-                predictions = outputs.permute(0, 3, 1, 2)
+                predictions = get_logits(outputs)
 
                 # compute loss
-                ce_loss = criterion(predictions, proj_labels)
-                lovasz_loss = self.lovasz(F.softmax(predictions, dim=1), proj_labels)
-                bd_loss = self.bd(F.softmax(predictions, dim=1), proj_labels)
-
-                loss = ce_loss + bd_loss + 1.5 * lovasz_loss
+                loss, loss_items = self.loss_fn(predictions, proj_labels, outputs=outputs)
 
             self.scaler.scale(loss).backward()
 
@@ -325,14 +337,16 @@ class Trainer():
                 self.writer_train.add_scalar(header + '/accuracy', acc.avg, step)
                 self.writer_train.add_scalar(header + '/mIoU', iou.avg, step)
                 self.writer_train.add_scalar(header + "/lr", self.optimizer.param_groups[0]["lr"], step)
-                self.writer_train.add_scalar(header + "/ce_loss", ce_loss.item(), step)
-                self.writer_train.add_scalar(header + "/lovasz_loss", lovasz_loss.item(), step)
-                #self.writer_train.add_scalar(header + "/focal_loss", focal_loss.item(), step)
-                self.writer_train.add_scalar(header + "/bd_loss", bd_loss.item(), step)
+                if "cross_entropy" in loss_items:
+                    self.writer_train.add_scalar(header + "/ce_loss", loss_items["cross_entropy"].item(), step)
+                if "lovasz" in loss_items:
+                    self.writer_train.add_scalar(header + "/lovasz_loss", loss_items["lovasz"].item(), step)
+                if "boundary" in loss_items:
+                    self.writer_train.add_scalar(header + "/bd_loss", loss_items["boundary"].item(), step)
 
         return acc.avg, iou.avg, losses.avg
 
-    def validate(self, val_loader, model, criterion, epoch, show_scans, color_fn, evaluator):
+    def validate(self, val_loader, model, epoch, show_scans, color_fn, evaluator):
         losses = AverageMeter()
         acc = AverageMeter()
         iou = AverageMeter()
@@ -353,14 +367,10 @@ class Trainer():
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
                     outputs = model(in_vol)
-                    predictions = outputs.permute(0, 3, 1, 2)
+                    predictions = get_logits(outputs)
 
                     # compute loss
-                    ce_loss = criterion(predictions, proj_labels)
-                    lovasz_loss = self.lovasz(F.softmax(predictions, dim=1), proj_labels)
-                    bd_loss = self.bd(F.softmax(predictions, dim=1), proj_labels)
-
-                    loss = ce_loss + bd_loss + 1.5 * lovasz_loss
+                    loss, loss_items = self.loss_fn(predictions, proj_labels, outputs=outputs)
 
                 argmax = predictions.argmax(dim=1)
                 evaluator.addBatch(argmax, proj_labels)
@@ -397,9 +407,25 @@ class Trainer():
             self.writer_val.add_scalar(header + '/loss', losses.avg, step)
             self.writer_val.add_scalar(header + '/accuracy', acc.avg, step)
             self.writer_val.add_scalar(header + '/mIoU', iou.avg, step)
-            self.writer_val.add_scalar(header + "/ce_loss", ce_loss.item(), step)
-            self.writer_val.add_scalar(header + "/lovasz_loss", lovasz_loss.item(), step)
-            #self.writer_val.add_scalar(header + "/focal_loss", focal_loss.item(), step)
-            self.writer_val.add_scalar(header + "/bd_loss", bd_loss.item(), step)
+            if "cross_entropy" in loss_items:
+                self.writer_val.add_scalar(header + "/ce_loss", loss_items["cross_entropy"].item(), step)
+            if "lovasz" in loss_items:
+                self.writer_val.add_scalar(header + "/lovasz_loss", loss_items["lovasz"].item(), step)
+            if "boundary" in loss_items:
+                self.writer_val.add_scalar(header + "/bd_loss", loss_items["boundary"].item(), step)
+
+            print("Validation per-class IoU:")
+            for class_idx, class_iou in enumerate(class_jaccard):
+                if class_idx in self.ignore_class:
+                    continue
+                class_name = self.parser.get_xentropy_class_string(class_idx)
+                print('  IoU class {i:} {class_str:} = {jacc:.3f}'.format(
+                    i=class_idx,
+                    class_str=class_name,
+                    jacc=class_iou))
+                safe_class_name = class_name.replace(" ", "_")
+                self.writer_val.add_scalar(f"{header}/class_iou/{safe_class_name}", class_iou.item(), step)
+                if self.tracker is not None:
+                    self.tracker.log_metric(f"val/class_iou/{safe_class_name}", class_iou.item(), step=step)
 
         return acc.avg, iou.avg, losses.avg

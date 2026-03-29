@@ -1,6 +1,7 @@
 # Code from https://github.com/nschi00/rangeview-rgb-lidar-fusion/blob/new-main/modules/network/RangePreprocessLidar.py
-import torch
 import random
+
+import torch
 
 def match_elements(n):
     list1 = list(range(n))
@@ -29,7 +30,7 @@ class RangeAugmentation():
     def __init__(self, aug_prob=[0.9, 0.2, 0.9, 1.0]):
         self.aug_prob = aug_prob
 
-    def __call__(self, data, label, mask) -> torch.Any:
+    def __call__(self, data, label, mask) -> tuple[torch.Tensor, torch.Tensor]:
         B, _, _, _ = data.shape
         if B < 2:
             return data, label

@@ -10,9 +10,10 @@ import numpy as np
 
 from utils.avgmeter import AverageMeter
 from utils.ioueval import iouEval
-from utils.knn import KNN
-
-from network.rangeret import RangeRet
+from utils.checkpoint import load_model_weights
+from network.factory import build_model
+from network.interfaces import get_logits
+from postprocess.factory import build_postprocess
 
 class User():
     def __init__(self, ARCH, DATA, datadir, logdir, modeldir, split, save=False, fp16=False):
@@ -57,20 +58,16 @@ class User():
         
         # load model
         with torch.no_grad():
-            self.model = RangeRet(self.ARCH['model_params'], self.parser.get_resolution(), self.parser.get_n_classes())
+            self.model = build_model(self.ARCH, self.parser.get_resolution(), self.parser.get_n_classes())
 
         try:
             #load model
-            self.model.load_state_dict(torch.load(self.modeldir), strict=True)
-            #self.model.load_state_dict(torch.load(self.modeldir, map_location=torch.device('cpu')), strict=True)
+            load_model_weights(self.model, self.modeldir, strict=True)
         except:
-            # load model from checkpoint
-            self.model.load_state_dict(torch.load(self.modeldir)['model_state_dict'], strict=True)
+            raise
 
         # knn post processing
-        self.post = None
-        if self.ARCH['model_params']['post']['KNN']['use']:
-            self.post = KNN(self.ARCH['model_params']['post']['KNN']['params'], self.parser.get_n_classes(), self.dataset_type)
+        self.post = build_postprocess(self.ARCH, self.parser.get_n_classes(), self.dataset_type)
 
         # GPU
         self.gpu = False
@@ -146,8 +143,8 @@ class User():
                         unproj_range = unproj_range.cuda()
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    proj_output = self.model(proj_in)
-                    predictions = proj_output.permute(0, 3, 1, 2)
+                    outputs = self.model(proj_in)
+                    predictions = get_logits(outputs)
                     proj_argmax = predictions[0].argmax(dim=0)
 
                 if self.post:

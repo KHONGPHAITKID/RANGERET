@@ -6,10 +6,13 @@ import random
 import datetime
 import argparse
 import subprocess
+import sys
 import numpy as np
+from pathlib import Path
 from shutil import copyfile
 
 from modules.trainer import Trainer
+from utils.mlflow_utils import MLflowTracker, TeeStream
 
 def seed_everything(seed=1024):
     random.seed(seed)
@@ -25,6 +28,10 @@ def seed_everything(seed=1024):
 
 if __name__ == '__main__':
     seed_everything()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    console_stream = None
+    tracker = None
 
     parser = argparse.ArgumentParser("./train.py")
     parser.add_argument(
@@ -118,6 +125,11 @@ if __name__ == '__main__':
         print("Error creating log directory. Check permissions!")
         quit()
 
+    console_path = Path(FLAGS.log) / "console.log"
+    console_stream = open(console_path, "w", encoding="utf-8", buffering=1)
+    sys.stdout = TeeStream(original_stdout, console_stream)
+    sys.stderr = TeeStream(original_stderr, console_stream)
+
     # does model folder exist?
     if FLAGS.checkpoint is not None:
         if os.path.isfile(FLAGS.checkpoint):
@@ -131,12 +143,46 @@ if __name__ == '__main__':
     # easier). Also, standardize name to be able to open it later
     try:
         print("Copying files to %s for further reference." % FLAGS.log)
-        copyfile(FLAGS.config, FLAGS.log + "/RangeRet-semantickitti.yaml")
+        copyfile(FLAGS.config, str(Path(FLAGS.log) / Path(FLAGS.config).name))
+        copyfile(FLAGS.data, str(Path(FLAGS.log) / Path(FLAGS.data).name))
         #copyfile(FLAGS.data_cfg, FLAGS.log + "/semantic-kitti.yaml")
     except Exception as e:
         print(e)
         print("Error copying files, check permissions. Exiting...")
         quit()
 
-    trainer = Trainer(ARCH, DATA, FLAGS.dataset, FLAGS.log, FLAGS.checkpoint, FLAGS.pretrained_model, FLAGS.fp16)
-    trainer.train()
+    tracker = MLflowTracker(ARCH.get("mlflow"), FLAGS.log, run_name_default=Path(FLAGS.log).name)
+    tracker.start(
+        params={
+            "dataset_dir": FLAGS.dataset,
+            "config_path": FLAGS.config,
+            "data_config_path": FLAGS.data,
+            "checkpoint": FLAGS.checkpoint,
+            "pretrained_model": FLAGS.pretrained_model,
+            "fp16": FLAGS.fp16,
+            "model_name": ARCH.get("model", {}).get("name", ARCH.get("model_params", {}).get("model_architecture")),
+            "dataset_type": ARCH["dataset"]["pc_dataset_type"],
+            "epochs": ARCH["train"]["epochs"],
+            "batch_size": ARCH["train"]["batch_size"],
+            "learning_rate": ARCH["train"]["learning_rate"],
+            "optimizer": ARCH["train"]["optimizer"],
+        }
+    )
+
+    try:
+        trainer = Trainer(ARCH, DATA, FLAGS.dataset, FLAGS.log, FLAGS.checkpoint, FLAGS.pretrained_model, FLAGS.fp16, tracker=tracker)
+        trainer.train()
+    except Exception:
+        if tracker is not None:
+            tracker.finish(status="FAILED")
+        raise
+    else:
+        if tracker is not None:
+            tracker.finish(status="FINISHED")
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if console_stream is not None:
+            console_stream.close()

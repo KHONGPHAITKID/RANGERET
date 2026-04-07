@@ -19,6 +19,7 @@ class SegmentationLossBundle(nn.Module):
         self.modules_map = nn.ModuleDict(modules)
 
     def forward(self, logits, labels, outputs=None):
+        logits = logits.float()
         total = logits.new_tensor(0.0)
         loss_items = {}
         probabilities = None
@@ -37,3 +38,5 @@ class SegmentationLossBundle(nn.Module):
 
         loss_items["total"] = total
         return total, loss_items
+
+

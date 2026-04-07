@@ -25,6 +25,8 @@ model:
 
     ffn_expand: 2
     dropout: 0.0
+    force_mamba_fp32: true
+    layer_scale_init: 1.0e-3
     use_boundary_head: false
 
 loss:
@@ -88,19 +90,21 @@ dataset:
 ## Train params
 train:
   epochs: 64
-  learning_rate: 1.0e-2
+  learning_rate: 1.0e-3
   weight_decay: 0.05
   optimizer: AdamW
   batch_size: 8
   workers: 4
   epsilon_w: 0.001
   range_aug: True
+  grad_clip: 1.0
 
   scheduler:
     name: "WarmupCosine"
-    max_lr: 0.01
+    max_lr: 0.001
     total_steps: 1000
     pct_start: 0.02
 
   report_epoch: 1
   show_scans: False
+

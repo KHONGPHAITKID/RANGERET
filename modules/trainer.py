@@ -149,6 +149,8 @@ class Trainer():
 
         # grad scaler
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.fp16)
+        self.grad_clip = self.ARCH['train'].get('grad_clip', None)
+
 
         # range augmentation (mix, union, paste, shift)
         if self.ARCH['train']['range_aug']:
@@ -292,7 +294,20 @@ class Trainer():
                 # compute loss
                 loss, loss_items = self.loss_fn(predictions, proj_labels, outputs=outputs)
 
+            if not torch.isfinite(predictions).all():
+                raise FloatingPointError(
+                    f"Non-finite logits detected at epoch {epoch + 1}, iteration {i}. "
+                    f"logits min={predictions.nan_to_num().min().item():.6g}, "
+                    f"max={predictions.nan_to_num().max().item():.6g}"
+                )
+            if not torch.isfinite(loss):
+                loss_debug = {name: value.detach().float().item() for name, value in loss_items.items() if torch.is_tensor(value)}
+                raise FloatingPointError(f"Non-finite loss detected at epoch {epoch + 1}, iteration {i}: {loss_debug}")
+
             self.scaler.scale(loss).backward()
+            if self.grad_clip is not None and self.grad_clip > 0:
+                self.scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
 
             self.scaler.step(optimizer)
             self.scaler.update()
@@ -429,3 +444,6 @@ class Trainer():
                     self.tracker.log_metric(f"val/class_iou/{safe_class_name}", class_iou.item(), step=step)
 
         return acc.avg, iou.avg, losses.avg
+
+
+

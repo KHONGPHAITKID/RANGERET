@@ -142,20 +142,26 @@ class Downsample2D(nn.Module):
 class MambaSequenceLayer(nn.Module):
     """Thin wrapper around mamba_ssm.Mamba for sequence tensors shaped (N, L, C)."""
 
-    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, force_fp32=False):
         super().__init__()
         self.mamba = Mamba(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.force_fp32 = force_fp32
 
     def forward(self, x):
-        return self.mamba(x)
+        if not self.force_fp32 or x.dtype == torch.float32:
+            return self.mamba(x)
+
+        out_dtype = x.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            return self.mamba(x.float()).to(out_dtype)
 
 
 class CircularRowBiMamba(nn.Module):
-    def __init__(self, dim, pad_len=16, d_state=16, d_conv=4, expand=2):
+    def __init__(self, dim, pad_len=16, d_state=16, d_conv=4, expand=2, force_fp32=False):
         super().__init__()
         self.pad_len = pad_len
-        self.forward_mamba = MambaSequenceLayer(dim, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.backward_mamba = MambaSequenceLayer(dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.forward_mamba = MambaSequenceLayer(dim, d_state=d_state, d_conv=d_conv, expand=expand, force_fp32=force_fp32)
+        self.backward_mamba = MambaSequenceLayer(dim, d_state=d_state, d_conv=d_conv, expand=expand, force_fp32=force_fp32)
         self.fuse = nn.Linear(dim * 2, dim)
 
     def forward(self, x):
@@ -178,10 +184,10 @@ class CircularRowBiMamba(nn.Module):
 
 
 class ColBiMamba(nn.Module):
-    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, force_fp32=False):
         super().__init__()
-        self.forward_mamba = MambaSequenceLayer(dim, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.backward_mamba = MambaSequenceLayer(dim, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.forward_mamba = MambaSequenceLayer(dim, d_state=d_state, d_conv=d_conv, expand=expand, force_fp32=force_fp32)
+        self.backward_mamba = MambaSequenceLayer(dim, d_state=d_state, d_conv=d_conv, expand=expand, force_fp32=force_fp32)
         self.fuse = nn.Linear(dim * 2, dim)
 
     def forward(self, x):
@@ -214,7 +220,18 @@ class ConvFFN(nn.Module):
 
 
 class CircularAxialMambaBlock(nn.Module):
-    def __init__(self, dim, row_pad_len=16, d_state=16, d_conv=4, mamba_expand=2, ffn_expand=2, dropout=0.0):
+    def __init__(
+        self,
+        dim,
+        row_pad_len=16,
+        d_state=16,
+        d_conv=4,
+        mamba_expand=2,
+        ffn_expand=2,
+        dropout=0.0,
+        force_mamba_fp32=False,
+        layer_scale_init=1e-3,
+    ):
         super().__init__()
         self.norm1 = RMSNorm2D(dim)
         self.local_dwconv = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
@@ -224,8 +241,9 @@ class CircularAxialMambaBlock(nn.Module):
             d_state=d_state,
             d_conv=d_conv,
             expand=mamba_expand,
+            force_fp32=force_mamba_fp32,
         )
-        self.col_mixer = ColBiMamba(dim, d_state=d_state, d_conv=d_conv, expand=mamba_expand)
+        self.col_mixer = ColBiMamba(dim, d_state=d_state, d_conv=d_conv, expand=mamba_expand, force_fp32=force_mamba_fp32)
         self.fuse = nn.Sequential(
             nn.Conv2d(dim * 3, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim),
@@ -233,14 +251,16 @@ class CircularAxialMambaBlock(nn.Module):
         )
         self.norm2 = RMSNorm2D(dim)
         self.ffn = ConvFFN(dim, expand=ffn_expand, dropout=dropout)
+        self.layer_scale_mixer = nn.Parameter(torch.ones(1, dim, 1, 1) * layer_scale_init)
+        self.layer_scale_ffn = nn.Parameter(torch.ones(1, dim, 1, 1) * layer_scale_init)
 
     def forward(self, x):
         h = self.norm1(x)
         local = self.local_dwconv(h)
         row = self.row_mixer(h)
         col = self.col_mixer(h)
-        x = x + self.fuse(torch.cat([row, col, local], dim=1))
-        return x + self.ffn(self.norm2(x))
+        x = x + self.layer_scale_mixer * self.fuse(torch.cat([row, col, local], dim=1))
+        return x + self.layer_scale_ffn * self.ffn(self.norm2(x))
 
 
 class DecoderFuse(nn.Module):
@@ -323,6 +343,8 @@ class RangeMambaC(SegmentationModel):
         row_pad = model_params.get("row_pad", [16, 8, 4])
         dropout = model_params.get("dropout", 0.0)
         ffn_expand = model_params.get("ffn_expand", 2)
+        force_mamba_fp32 = model_params.get("force_mamba_fp32", True)
+        layer_scale_init = model_params.get("layer_scale_init", 1e-3)
         use_boundary_head = model_params.get("use_boundary_head", False)
 
         if len(stage_dims) != 3:
@@ -348,17 +370,17 @@ class RangeMambaC(SegmentationModel):
         self.input_resolution = resolution
         self.stem = RangeMambaStem(input_dim, stem_dim)
         self.patch1 = PatchEmbed2D(stem_dim, c1, kernel_size=patch_kernel, stride=patch_stride, padding=patch_padding)
-        self.stage1 = self._make_stage(d1, c1, p1, d_state, d_conv, mamba_expand, ffn_expand, dropout)
+        self.stage1 = self._make_stage(d1, c1, p1, d_state, d_conv, mamba_expand, ffn_expand, dropout, force_mamba_fp32, layer_scale_init)
         self.down12 = Downsample2D(c1, c2)
-        self.stage2 = self._make_stage(d2, c2, p2, d_state, d_conv, mamba_expand, ffn_expand, dropout)
+        self.stage2 = self._make_stage(d2, c2, p2, d_state, d_conv, mamba_expand, ffn_expand, dropout, force_mamba_fp32, layer_scale_init)
         self.down23 = Downsample2D(c2, c3)
-        self.stage3 = self._make_stage(d3, c3, p3, d_state, d_conv, mamba_expand, ffn_expand, dropout)
+        self.stage3 = self._make_stage(d3, c3, p3, d_state, d_conv, mamba_expand, ffn_expand, dropout, force_mamba_fp32, layer_scale_init)
         self.decoder = FPNDecoder(c3=c3, c2=c2, c1=c1, c0=stem_dim)
         self.seg_head = SegHead(stem_dim, num_classes)
         self.boundary_head = BoundaryHead(stem_dim) if use_boundary_head else None
 
     @staticmethod
-    def _make_stage(depth, dim, row_pad_len, d_state, d_conv, mamba_expand, ffn_expand, dropout):
+    def _make_stage(depth, dim, row_pad_len, d_state, d_conv, mamba_expand, ffn_expand, dropout, force_mamba_fp32, layer_scale_init):
         return nn.Sequential(
             *[
                 CircularAxialMambaBlock(
@@ -369,6 +391,8 @@ class RangeMambaC(SegmentationModel):
                     mamba_expand=mamba_expand,
                     ffn_expand=ffn_expand,
                     dropout=dropout,
+                    force_mamba_fp32=force_mamba_fp32,
+                    layer_scale_init=layer_scale_init,
                 )
                 for _ in range(depth)
             ]

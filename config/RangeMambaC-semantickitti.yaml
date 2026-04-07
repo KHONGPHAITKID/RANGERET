@@ -90,18 +90,18 @@ dataset:
 ## Train params
 train:
   epochs: 64
-  learning_rate: 1.0e-3
+  learning_rate: 1.0e-4
   weight_decay: 0.05
   optimizer: AdamW
   batch_size: 8
   workers: 4
   epsilon_w: 0.001
   range_aug: True
-  grad_clip: 1.0
+  grad_clip: 0.5
 
   scheduler:
     name: "WarmupCosine"
-    max_lr: 0.001
+    max_lr: 0.0001
     total_steps: 1000
     pct_start: 0.02
 

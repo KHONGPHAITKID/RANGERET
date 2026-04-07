@@ -295,19 +295,29 @@ class Trainer():
                 loss, loss_items = self.loss_fn(predictions, proj_labels, outputs=outputs)
 
             if not torch.isfinite(predictions).all():
+                finite_predictions = predictions[torch.isfinite(predictions)]
+                finite_min = finite_predictions.min().item() if finite_predictions.numel() > 0 else float("nan")
+                finite_max = finite_predictions.max().item() if finite_predictions.numel() > 0 else float("nan")
+                nan_count = torch.isnan(predictions).sum().item()
+                inf_count = torch.isinf(predictions).sum().item()
                 raise FloatingPointError(
                     f"Non-finite logits detected at epoch {epoch + 1}, iteration {i}. "
-                    f"logits min={predictions.nan_to_num().min().item():.6g}, "
-                    f"max={predictions.nan_to_num().max().item():.6g}"
+                    f"finite min={finite_min:.6g}, finite max={finite_max:.6g}, "
+                    f"nan_count={nan_count}, inf_count={inf_count}"
                 )
             if not torch.isfinite(loss):
                 loss_debug = {name: value.detach().float().item() for name, value in loss_items.items() if torch.is_tensor(value)}
                 raise FloatingPointError(f"Non-finite loss detected at epoch {epoch + 1}, iteration {i}: {loss_debug}")
 
             self.scaler.scale(loss).backward()
+            self.scaler.unscale_(optimizer)
             if self.grad_clip is not None and self.grad_clip > 0:
-                self.scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), self.grad_clip)
+                if not torch.isfinite(grad_norm):
+                    print(f"Skipping optimizer step because gradient norm is non-finite at epoch {epoch + 1}, iteration {i}: {grad_norm}")
+                    optimizer.zero_grad(set_to_none=True)
+                    self.scaler.update()
+                    continue
 
             self.scaler.step(optimizer)
             self.scaler.update()

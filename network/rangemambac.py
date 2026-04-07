@@ -151,9 +151,8 @@ class MambaSequenceLayer(nn.Module):
         if not self.force_fp32 or x.dtype == torch.float32:
             return self.mamba(x)
 
-        out_dtype = x.dtype
         with torch.cuda.amp.autocast(enabled=False):
-            return self.mamba(x.float()).to(out_dtype)
+            return self.mamba(x.float())
 
 
 class CircularRowBiMamba(nn.Module):

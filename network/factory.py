@@ -33,5 +33,9 @@ def build_model(arch, resolution, num_classes, activate_recurrent=False):
         from network.mambarv import MambaRV
 
         return MambaRV(params, resolution, num_classes, activate_recurrent=activate_recurrent)
+    if name in {"rangemambac", "range_mamba_c", "rangemamba_c"}:
+        from network.rangemambac import RangeMambaC
+
+        return RangeMambaC(params, resolution, num_classes, activate_recurrent=activate_recurrent)
 
     raise ValueError(f"Unsupported model architecture: {model_cfg['name']}")

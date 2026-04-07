@@ -76,7 +76,7 @@ train:
   batch_size: 8   # batch size (default rangeret 8)
   workers: 4     # number of threads to get data
   epsilon_w: 0.001       # class weight w = 1 / (content + epsilon_w)
-  range_aug: False       # range image augmentations
+  range_aug: True        # range image augmentations
   
   scheduler:
     name: "WarmupCosine"  # [OneCycle, WarmupCosine]
@@ -87,3 +87,12 @@ train:
 
   report_epoch: 1 # report every epoch
   show_scans: False # show scans during training
+
+mlflow:
+  enable: true
+  tracking_uri: "http://140.245.117.232:5000"
+  experiment_name: "rangeret"
+  run_name: "[train] rangeret_semantickitti"
+  nested: false
+  log_checkpoints: true
+  log_code_snapshot: true

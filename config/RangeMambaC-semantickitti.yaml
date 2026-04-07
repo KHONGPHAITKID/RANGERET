@@ -4,27 +4,28 @@ format_version: 2
 ###################
 ## Model options
 model:
-  name: "rangeret"
+  name: "rangemambac"
+  pretrained_component: "full"
   params:
-    backbone: "retnet"        # [retnet, vit]
+    input_dim: 5
+    stem_dim: 96
 
-    patch_size: [7, 7]        # size of patch
-    stride: [4, 4]            # stride (1 for full overlapping, patch_size for no overlapping)
-    pool: False               # average pool to extract patches
+    stage_dims: [128, 192, 256]
+    stage_depths: [3, 4, 6]
 
-    input_dim: 5              # range image features
-    base_dim: 128             # base stem dimension
-    dim: 128                  # hidden stem dimension
+    patch_kernel: 7
+    patch_stride: 4
+    patch_padding: 3
 
-    retnet:
-      layers: 8               # number of blocks per stage
-      model_dim: 128          # hidden retnet dimension
-      mlp_ratio: 2            # feed forward network dimension wrt dim
-      num_head: 4             # number of heads per layer
-      double_v_dim: True      # double v dimension wrt hidden_size
+    row_pad: [16, 8, 4]
+    mamba:
+      d_state: 16
+      d_conv: 4
+      expand: 2
 
-    decoder_dim: 64           # semantic head hidden dimension
-    drop: 0.3                 # drop path rate
+    ffn_expand: 2
+    dropout: 0.0
+    use_boundary_head: false
 
 loss:
   terms:
@@ -43,6 +44,15 @@ postprocess:
     search: 7
     sigma: 1.0
     cutoff: 1.0
+
+mlflow:
+  enable: true
+  tracking_uri: "http://140.245.117.232:5000"
+  experiment_name: "rangeret"
+  run_name: "[train] rangemambac_semantickitti"
+  nested: false
+  log_checkpoints: true
+  log_code_snapshot: true
 
 ###################
 ## Dataset options
@@ -94,12 +104,3 @@ train:
 
   report_epoch: 1
   show_scans: False
-
-mlflow:
-  enable: true
-  tracking_uri: "http://140.245.117.232:5000"
-  experiment_name: "rangeret"
-  run_name: "[train] rangeret_semantickitti"
-  nested: false
-  log_checkpoints: true
-  log_code_snapshot: true

@@ -26,7 +26,7 @@ def match_elements(n):
     return matches
 
 class RangeAugmentation():
-    def __init__(self, aug_prob=[0.9, 0.7, 0.9, 0.0, 0.9], dataset='kitti'):
+    def __init__(self, aug_prob=[0.9, 0.7, 0.9, 0.1, 0.9], dataset='kitti'):
         self.aug_prob = aug_prob
         self.dataset = dataset
 
